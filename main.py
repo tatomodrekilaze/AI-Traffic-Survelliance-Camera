@@ -12,6 +12,7 @@ from datetime import datetime, timezone, timedelta
 from collections import deque, Counter
 from ultralytics import YOLO
 import ipywidgets as widgets
+from IPython import get_ipython
 from IPython.display import display
 
 # Has to be set before cv2 opens any capture, or ffmpeg just ignores it.
