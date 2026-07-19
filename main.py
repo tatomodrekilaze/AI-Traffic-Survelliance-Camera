@@ -1,8 +1,3 @@
-try:
-    import lap
-except ImportError:
-    get_ipython().system('pip install "lap>=0.5.12" -q')
-
 import cv2
 import numpy as np
 import time
