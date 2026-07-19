@@ -19,6 +19,18 @@ from ultralytics import YOLO
 import ipywidgets as widgets
 from IPython.display import display
 
+# Has to be set before cv2 opens any capture, or ffmpeg just ignores it.
+# Landed on this exact combo after the reader kept silently dying on the
+# rtsp.me relay instead of reconnecting:
+#   reconnect / reconnect_streamed / reconnect_at_eof - without these three,
+#     ffmpeg treats one dropped HLS segment as end-of-stream and just stops.
+#   reconnect_delay_max;2 - default backoff is way too patient for a feed
+#     that's already cycling every ~6s on its own (see FreshestFrameReader).
+#   analyzeduration/probesize;150000 - lower than default so ffmpeg commits
+#     to a format guess fast instead of stalling the first open.
+#   timeout;1200000 - 1.2s in microseconds. Long enough to survive one bad
+#     segment, short enough that a genuinely dead link fails fast instead
+#     of hanging the capture thread.
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
     "reconnect;1|reconnect_streamed;1|reconnect_at_eof;1|"
     "reconnect_delay_max;2|analyzeduration;150000|probesize;150000|"
@@ -99,6 +111,13 @@ RECONNECT_STORM_WINDOW_SEC = 90.0
 RECONNECT_STORM_THRESHOLD = 6
 READER_WATCHDOG_INTERVAL_SEC = 5.0
 
+# Per-class thresholds, not one global conf value - COCO classes 1/3
+# (bicycle/motorcycle) get missed constantly at this camera's distance and
+# angle, so those run lower to catch more of them at the cost of some noise.
+# Class 0 (person) runs higher than the rest specifically because false
+# pedestrian detections are what trigger the blur toggle and afk/idle
+# logging, and a shadow or a parked scooter getting tagged as a loitering
+# person was noisy enough in early runs to be worth trading recall for.
 CLASS_CONF = {0: 0.30, 1: 0.15, 2: 0.25, 3: 0.18, 5: 0.25, 7: 0.25}
 TRACKED_CLASSES = {0: 'Human', 1: 'Scooter/Bicycle', 2: 'Car/SUV', 3: 'Scooter/Motorcycle', 5: 'Bus', 7: 'Truck'}
 
@@ -366,6 +385,12 @@ class FreshestFrameReader:
             pass
 
 
+# Calibration is click-to-draw-polygon rather than typed coordinates because
+# the zone polygons in DEFAULT_ZONES below were themselves produced by this
+# tool - eyeballing pixel coordinates for an 18-point sidewalk polygon by
+# hand isn't realistic, and the camera's mounting angle/zoom drifts slightly
+# whenever the housing gets bumped, so re-calibrating needs to be fast enough
+# to actually happen instead of getting skipped.
 if RUN_CALIBRATION:
     import matplotlib.pyplot as plt
     get_ipython().system('pip install ipympl -q')
@@ -493,6 +518,12 @@ else:
     USE_HALF = False
     if torch.cuda.is_available():
         model.to('cuda')
+        # torch.cuda.is_available() only proves a GPU exists, not that this
+        # particular Colab GPU behaves under FP16 - on the T4/K80 rotation
+        # Colab hands out, half precision has silently thrown NaNs on some
+        # ops rather than raising, which is worse than just erroring. So
+        # instead of trusting the flag, actually run one real frame through
+        # half precision at startup and only commit to it if that succeeds.
         try:
             model.half()
             _warm = np.zeros((FRAME_H, FRAME_W, 3), dtype=np.uint8)
@@ -559,22 +590,34 @@ else:
         return cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
 
     def hue_to_label(h_val, s_val, v_val):
+        # Value/saturation get checked before hue on purpose, not just because
+        # that's the "correct" HSV order. Most vehicles crossing this camera
+        # are white, silver, black, or gray, and on the compressed HLS feed
+        # those all land with washed-out saturation regardless of what hue
+        # channel noise says. Checking hue first misclassified a lot of
+        # silver cars as green/blue during testing, since low-saturation
+        # pixels have an essentially random hue.
         if v_val < 55:
             return "Black/Dark"
         if s_val < 50:
             return "White/Silver" if v_val > 155 else "Gray"
+
+        # Below here s_val is high enough that hue is actually meaningful.
+        # These band edges aren't the textbook 30/60/90/etc split - they're
+        # nudged from testing against snapshots pulled off this specific feed,
+        # where JPEG compression pushes reds a few degrees warm and blues a
+        # few degrees toward purple compared to a clean sensor.
         if h_val < 10 or h_val > 170:
             return "Red"
-        elif h_val < 25:
+        if h_val < 25:
             return "Orange"
-        elif h_val < 40:
+        if h_val < 40:
             return "Yellow"
-        elif h_val < 85:
+        if h_val < 85:
             return "Green"
-        elif h_val < 135:
+        if h_val < 135:
             return "Blue"
-        else:
-            return "Purple"
+        return "Purple"
 
     def extract_vehicle_color_sample(clean_frame, x1, y1, x2, y2):
         w, h = x2 - x1, y2 - y1
@@ -630,19 +673,34 @@ else:
         return f"{label} (Night Est.)" if IS_NIGHT_MODE else label
 
     def get_direction(dx, dy):
+        # 5px dead zone matters more than it looks like it should - without it,
+        # a car sitting at the roundabout stop line flickers between whatever
+        # directions its detection box jitters toward frame to frame, which
+        # made the on-screen label unreadable for anything not actually moving.
         if abs(dx) < 5 and abs(dy) < 5:
             return "IDLE"
-        angle = np.degrees(np.arctan2(dy, dx))
-        if -22.5 <= angle < 22.5: return "E"
-        elif 22.5 <= angle < 67.5: return "SE"
-        elif 67.5 <= angle < 112.5: return "S"
-        elif 112.5 <= angle < 157.5: return "SW"
-        elif angle >= 157.5 or angle < -157.5: return "W"
-        elif -157.5 <= angle < -112.5: return "NW"
-        elif -112.5 <= angle < -67.5: return "N"
-        elif -67.5 <= angle < -22.5: return "NE"
-        return "UKN"
 
+        # image y grows downward, so this is screen-space angle, not compass
+        # angle - it only maps onto real N/S/E/W because the camera happens
+        # to be mounted looking roughly north over the roundabout. If this
+        # rig ever gets pointed at a different intersection, these labels
+        # need re-deriving against that camera's actual orientation.
+        angle = np.degrees(np.arctan2(dy, dx))
+        compass_bins = (
+            (-22.5, 22.5, "E"), (22.5, 67.5, "SE"), (67.5, 112.5, "S"),
+            (112.5, 157.5, "SW"), (-67.5, -22.5, "NE"), (-112.5, -67.5, "N"),
+            (-157.5, -112.5, "NW"),
+        )
+        for lo, hi, label in compass_bins:
+            if lo <= angle < hi:
+                return label
+        return "W" if (angle >= 157.5 or angle < -157.5) else "UKN"
+
+    # Video feed and admin log side by side rather than log-below-video: on
+    # the Colab notebook width this project actually gets viewed at, stacking
+    # them vertically pushed the log panel below the fold, which defeats the
+    # point of it being live. Toggles live under the log column specifically
+    # because they're admin-facing controls, not part of the feed itself.
     video_screen = widgets.Image(format='jpeg', width=750, height=420, layout=widgets.Layout(border='3px solid #2c2c2e'))
     admin_logs = widgets.Textarea(value="System Active\n", layout=widgets.Layout(width='350px', height='360px', border='2px solid #555', padding='5px'))
     stats_panel = widgets.HTML(value="Counting initialized")
@@ -819,6 +877,23 @@ else:
         vtype = ""
         detail = ""
 
+        # These three inside_dist cutoffs aren't the same number on purpose.
+        # inside_dist is measured in pixels from the zone edge using the
+        # tracked object's ground point, and how far "in" that point sits
+        # before it means something is different per class:
+        #   cars (6.0) - a car's ground point is the bottom-center of a wide
+        #     bbox, which clips a few px into an adjacent zone constantly on
+        #     any curve or camera-angle foreshortening. 6px is roughly what
+        #     it takes to separate "actually on the sidewalk" from "normal
+        #     bbox noise on a vehicle that's still on the road" - this is
+        #     also why there's a separate WARNING_BOUNDARY tier below instead
+        #     of just raising this number and losing the near-miss signal.
+        #   pedestrians (1.0) - a person's footprint is small and their
+        #     ground point tracks their actual feet closely, so there's no
+        #     equivalent bbox-clipping noise to buffer against; a person's
+        #     ground point in ROAD basically means they're in the road.
+        #   scooters (2.0) - splits the difference: narrower footprint than
+        #     a car but still enough bbox jitter at speed to want some buffer.
         if is_car:
             if zone == "SIDEWALK" and inside_dist >= 6.0:
                 triggered = True
@@ -919,6 +994,10 @@ else:
             _mm_zone_polys.append((zname, scaled))
 
     def draw_minimap(frame_resized, minimap_points):
+        # 0.75 favors the minimap panel over whatever's in that corner of the
+        # live feed - at 0.5/0.5 the zone colors got hard to read against
+        # moving video underneath them, and this corner rarely has anything
+        # in the actual feed worth seeing through anyway.
         x0, y0 = FRAME_W - MM_W - 10, FRAME_H - MM_H - 10
         panel = np.zeros((MM_H, MM_W, 3), dtype=np.uint8)
         panel[:] = (25, 25, 25)
@@ -933,6 +1012,12 @@ else:
         frame_resized[y0:y0 + MM_H, x0:x0 + MM_W] = blended
 
     def blur_region(frame_resized, x1, y1, x2, y2):
+        # Only the top 55% of the box, not the whole bbox - that's roughly
+        # head-and-shoulders on a standing pedestrian at this camera's
+        # typical distance. Blurring the full box also smeared out legs/feet,
+        # which made it harder to tell pedestrians from scooters/shadows in
+        # the already-blurred output, defeating half the point of watching
+        # the feed at all.
         h = y2 - y1
         bx1, by1, bx2, by2 = x1, y1, x2, y1 + int(h * 0.55)
         bx1, by1 = max(0, bx1), max(0, by1)
