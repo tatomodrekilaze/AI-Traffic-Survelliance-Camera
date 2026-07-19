@@ -4,6 +4,9 @@ A real-time computer vision pipeline that takes a public live traffic camera fee
 
 I built this solo for a UG Engineering hackathon and ran out of time before I could take it further. Everything below is real and running; I'm documenting it properly so whoever picks this up next doesn't have to reverse-engineer the math from the code. See "Known Limitations / Where to Take This Next" before you extend it.
 
+![Live system running](assets/live_system_screenshot.png)
+*Live output: 60.1 FPS, 0 reconnects, gap-reset logic firing correctly during a real network hiccup (note the "resetting speed tracking" log lines instead of a bogus spike), night mode active with per-vehicle color estimation.*
+
 ---
 
 ## What it actually does
@@ -59,7 +62,14 @@ Also expects `yolov8s.pt` (downloaded automatically by `ultralytics` on first ru
 
 2. **Get a fresh camera link.** Go to the [icam.ge Batumi live page](https://icam.ge/live-cameras/batumi-live), grab the current embed/stream link, and set it as `STREAM_URL` near the top of the script.
 
-3. **Calibrate the zones for your camera framing.** The default polygons in `DEFAULT_ZONES` were hand-drawn for one specific crop/zoom of this camera. If your stream looks even slightly different (different zoom, different pan, different camera entirely), those polygons won't line up with the real grass/sidewalk/road boundaries, and you'll get false violations almost immediately. To fix this:
+3. **Calibrate the zones for your camera framing.** The default polygons in `DEFAULT_ZONES` were hand-drawn for one specific crop/zoom of this camera. If your stream looks even slightly different (different zoom, different pan, different camera entirely), those polygons won't line up with the real grass/sidewalk/road boundaries, and you'll get false violations almost immediately.
+
+   Here's the actual calibration used for this deployment, drawn against the real roundabout the camera covers — this is what `RUN_CALIBRATION = True` produces, saved to `zone_calibration.json`:
+
+   ![Calibrated zone map](assets/calibrated_zone_map.png)
+   *Grass (restricted area) marked around the central roundabout island and two verge strips, sidewalk sections along the building frontage and the lower-right walkway, and one combined parking/sidewalk region on the upper-left approach. Everything unmarked defaults to "road."*
+
+   To recreate this for your own camera:
    - Set `RUN_CALIBRATION = True` at the top of the script and run it
    - An interactive matplotlib canvas will show a frozen frame from your stream — click points to trace each zone (grass, sidewalk, parking), hit "Finish Shape" per zone, then "Save"
    - Set `RUN_CALIBRATION` back to `False` and re-run the main script
@@ -91,6 +101,8 @@ The reason this isn't solvable with a single constant is **perspective foreshort
 
 **[Diagram: perspective foreshortening — why a fixed pixel distance means different real-world distances depending on where it is in frame]**
 
+![Perspective foreshortening](assets/diagram_depth_correction.png)
+
 This is exactly why a naive `speed = pixels_moved / time` calculation is wrong — it silently assumes every pixel is worth the same number of real-world feet, everywhere in the frame. That assumption breaks precisely at the parts of the frame where accurate speed estimates matter most.
 
 ### 2. The fix: a depth-weighted correction curve
@@ -113,6 +125,26 @@ Breaking that down term by term:
 - **`CALIBRATION_FACTOR = 0.12`** — the base pixel-to-feet ratio at the near edge of frame, hand-tuned by comparing known real-world distances (lane widths, crosswalk markings visible in the feed) against their pixel measurements.
 - **`× 0.681818`** — the unit conversion from feet-per-second to miles-per-hour (1 ft/s = 3600/5280 mph ≈ 0.681818).
 
+**Worked example — the same car, two positions in frame.** This is the calculation that actually justifies the whole formula, so it's worth doing by hand once. Take a vehicle whose ground point moves 40 pixels between two consecutive frames, with `dt = 0.2s` (a 5 fps effective sampling rate), on an 850×480 frame (`FRAME_H = 480`):
+
+*Case A — near the bottom of frame (`gy = 460`, close to the camera):*
+```
+depth_ratio  = (480 − 460) / 480        = 0.0417
+depth_mult   = 1 + (0.0417)^1.8 × 3.5   ≈ 1 + 0.0044 × 3.5   ≈ 1.015
+feet_moved   = 40 × 0.12 × 1.015        ≈ 4.87 ft
+speed        = (4.87 / 0.2) × 0.681818  ≈ 16.6 mph
+```
+
+*Case B — near the top of frame (`gy = 90`, far from the camera):*
+```
+depth_ratio  = (480 − 90) / 480         = 0.8125
+depth_mult   = 1 + (0.8125)^1.8 × 3.5   ≈ 1 + 0.665 × 3.5   ≈ 3.33
+feet_moved   = 40 × 0.12 × 3.33         ≈ 16.0 ft
+speed        = (16.0 / 0.2) × 0.681818  ≈ 54.5 mph
+```
+
+**Same 40-pixel displacement, same 0.2s window, a 3.3× difference in computed speed** — purely because of where in the frame it happened. That's not noise or a bug margin, that's the entire point of the correction: without it, a car doing a legitimate 16 mph near the camera and a car doing 16 mph-computed-wrong far from the camera would be indistinguishable, and the system would either miss real speeding far from the lens or falsely flag slow traffic near it. The `1.8` exponent and `3.5` scale factor are exactly what's tuned so that Case A and Case B, for the *same real-world speed*, land close to each other instead of 3× apart — get those two constants right and the whole speed-detection pipeline becomes trustworthy across the full depth of the frame, not just near the calibration point.
+
 The result gets smoothed with a simple exponential moving average (`speed = 0.8 × old_speed + 0.2 × new_estimate`) so a single noisy detection frame can't spike the displayed speed — this is also *why* the earlier stream-lag bug (documented in the code comments around the reconnect logic) was such a nasty one: any large, sudden pixel jump caused by a dropped/skipped frame gets read by this formula as extreme velocity, because the formula has no way to know the elapsed real time was also anomalous. The fix in the code resets tracking history whenever a frame gap exceeds a threshold, specifically so `dt` in the denominator never silently includes a multi-second stall.
 
 **Honest caveat, stated plainly:** this is a first-order approximation, not a calibrated measurement system. A proper solution would use the camera's intrinsic/extrinsic parameters and a full homography to map image coordinates to a ground-plane coordinate system, which would make the pixel-to-feet ratio exact at every point in the frame instead of a tuned curve. That's the correct next step for anyone extending this (see the limitations section) — but the current approach gets a genuinely usable relative signal ("this car is going roughly 2x the speed limit") out of a single uncalibrated camera, which is the actual constraint this was built under.
@@ -122,6 +154,8 @@ The result gets smoothed with a simple exponential moving average (`speed = 0.8 
 Each restricted area (grass, sidewalk, parking) is stored as a polygon — a list of `(x, y)` vertices drawn once against the camera's frame. For every tracked object, the system computes its **ground-contact point**: not the center of its bounding box, but `((x1 + x2) / 2, y2)` — the horizontal midpoint at the *bottom* edge of the box. This matters: the bottom of a bounding box is where the object actually touches the ground plane, which is the only point that has a meaningful physical position on a 2D map. The top of the box is just "how tall the object's pixels are," which depends on distance from camera and tells you nothing about where it's standing.
 
 **[Diagram: ground-contact point tested against a zone polygon, with signed distance to the boundary]**
+
+![Zone containment check](assets/diagram_zone_containment.png)
 
 That ground point is tested against every zone polygon using OpenCV's `pointPolygonTest`, which doesn't just return true/false — it returns a **signed distance** to the nearest polygon edge: positive if the point is inside, negative if outside, magnitude equal to the real pixel distance to the boundary. That signed value is what makes the violation logic more than a naive containment check:
 
