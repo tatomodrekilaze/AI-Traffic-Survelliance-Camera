@@ -89,8 +89,6 @@ Also expects `yolov8s.pt` (downloaded automatically by `ultralytics` on first ru
 
 ## The math
 
-*(The three `[Diagram: ...]` markers below correspond to the three visuals generated alongside this README — worth pasting in as images if you're turning this into a submission doc or slide.)*
-
 This is the part I actually care about explaining properly, because "it uses YOLO" undersells what's happening — the interesting problem here isn't detection, it's turning a single fixed 2D camera into something that can estimate real-world speed and real-world position without any depth sensor, stereo rig, or lidar. Everything below is derived from a monocular image plane, which is a genuinely constrained problem, and the two tricks that make it work (depth-weighted perspective correction, and signed-distance zone containment) are worth understanding rather than just copying.
 
 ### 1. The core problem: a camera doesn't see distance, it sees angle
